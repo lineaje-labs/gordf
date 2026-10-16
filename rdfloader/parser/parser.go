@@ -16,6 +16,7 @@ type Parser struct {
 	Triples          []*Triple
 	writeLock        sync.RWMutex
 	nodesWriteLock   sync.RWMutex
+	errLock          sync.Mutex
 	SchemaDefinition map[string]uri.URIRef
 	blankNodeGetter  BlankNodeGetter
 	rdfNS            uri.URIRef
@@ -90,17 +91,31 @@ func getLastURI(tag xmlreader.Tag, lastURI string) string {
 func New() (parser *Parser) {
 	// creates a new parser object
 	rdfNS, _ := uri.NewURIRef(RDFNS)
-	return &Parser{
+	parser = &Parser{
 		setTriples:       map[string]*Triple{},
 		setNodes:         map[string]*Node{},
 		Triples:          []*Triple{},
 		writeLock:        sync.RWMutex{},
 		nodesWriteLock:   sync.RWMutex{},
 		SchemaDefinition: map[string]uri.URIRef{"": uri.URIRef{}},
-		blankNodeGetter:  BlankNodeGetter{-1},
+		blankNodeGetter:  BlankNodeGetter{},
 		wg:               sync.WaitGroup{},
 		rdfNS:            rdfNS,
 	}
+	parser.blankNodeGetter.set(-1)
+	return parser
+}
+
+func (parser *Parser) setErr(errp *error, err error) {
+	parser.errLock.Lock()
+	*errp = err
+	parser.errLock.Unlock()
+}
+
+func (parser *Parser) getErr(errp *error) error {
+	parser.errLock.Lock()
+	defer parser.errLock.Unlock()
+	return *errp
 }
 
 func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI string, errp *error) {
@@ -139,7 +154,7 @@ func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI
 		predicateURI := parser.rdfNS.AddFragment("type")
 		openingTagUri, newErr := parser.uriFromPair(currBlock.OpeningTag.SchemaName, currBlock.OpeningTag.Name)
 		if newErr != nil {
-			*errp = newErr
+			parser.setErr(errp, newErr)
 			return
 		}
 		parser.appendTriple(&Triple{
@@ -154,14 +169,14 @@ func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI
 		//     according to https://www.w3.org/TR/rdf-concepts/#dfn-predicate
 		predicateURI, newErr := parser.uriFromPair(predicateBlock.OpeningTag.SchemaName, predicateBlock.OpeningTag.Name)
 		if newErr != nil {
-			*errp = fmt.Errorf("error creating a reference URI link for the predicate block. %v", newErr)
+			parser.setErr(errp, fmt.Errorf("error creating a reference URI link for the predicate block. %v", newErr))
 			return
 		}
 		predicateNode := &Node{NodeType: IRI, ID: predicateURI.String()}
 
 		openingTagUri, newErr := parser.uriFromPair(currBlock.OpeningTag.SchemaName, currBlock.OpeningTag.Name)
 		if newErr != nil {
-			*errp = newErr
+			parser.setErr(errp, newErr)
 			return
 		}
 
@@ -180,13 +195,13 @@ func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI
 				Object:    nil,
 			}
 			resIdx, newErr := parser.getRDFAttributeIndex(predicateBlock.OpeningTag, "resource")
-			*errp = newErr
-			if *errp != nil {
+			if newErr != nil {
+				parser.setErr(errp, newErr)
 				return
 			}
 			nodeidIdx, newErr := parser.getRDFAttributeIndex(predicateBlock.OpeningTag, "nodeID")
-			*errp = newErr
-			if *errp != nil {
+			if newErr != nil {
+				parser.setErr(errp, newErr)
 				return
 			}
 
@@ -205,7 +220,6 @@ func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI
 				}
 			default:
 				// it is a literal node without any special attributes
-				resIdx, newErr = parser.getRDFAttributeIndex(predicateBlock.OpeningTag, "nodeID")
 				currentTriple.Object = &Node{
 					NodeType: LITERAL,
 					ID:       predicateBlock.Value,
@@ -220,7 +234,7 @@ func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI
 		for _, objectBlock := range predicateBlock.Children {
 			objectNode, newErr := parser.nodeFromTag(objectBlock.OpeningTag, lastURI)
 			if newErr != nil {
-				*errp = newErr
+				parser.setErr(errp, newErr)
 				return
 			}
 
@@ -231,7 +245,7 @@ func (parser *Parser) parseBlock(currBlock *xmlreader.Block, node *Node, lastURI
 			})
 			parser.wg.Add(1)
 			go parser.parseBlock(objectBlock, objectNode, lastURI, errp)
-			if *errp != nil {
+			if parser.getErr(errp) != nil {
 				return
 			}
 		}
@@ -250,17 +264,20 @@ func (parser *Parser) Parse(rootBlock xmlreader.Block) (err error) {
 	var childNode *Node
 	xmlns := schemaDefinition[""]
 	xmlnsString := xmlns.String()
+	// goroutineErr is separate from err so the main loop's nodeFromTag writes
+	// never race with goroutine writes.
+	var goroutineErr error
 	for _, child := range rootBlock.Children {
 		childNode, err = parser.nodeFromTag(child.OpeningTag, xmlnsString)
 		if err != nil {
 			return err
 		}
 		parser.wg.Add(1)
-		go parser.parseBlock(child, childNode, xmlnsString, &err)
-		if err != nil {
-			return err
-		}
+		go parser.parseBlock(child, childNode, xmlnsString, &goroutineErr)
 	}
 	parser.wg.Wait() // wait for all the go routines to finish executing.
-	return err
+	if goroutineErr != nil {
+		return goroutineErr
+	}
+	return nil
 }
